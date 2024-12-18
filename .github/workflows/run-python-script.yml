@@ -1,7 +1,9 @@
 name: Run Python Script
 
 on:
-  star:
+  watch:
+    types: started
+    
 
 jobs:
   run-python:
