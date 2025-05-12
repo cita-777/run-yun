@@ -1,11 +1,13 @@
 import base64
+import math
 import random
 import time
 import requests
 import json
 import configparser
+import hashlib
 import os
-from typing import  Dict
+from typing import List, Dict
 from gmssl.sm4 import CryptSM4, SM4_ENCRYPT, SM4_DECRYPT
 import sys
 import gmssl.sm2 as sm2
@@ -13,6 +15,12 @@ from base64 import b64encode, b64decode
 import traceback
 import gzip
 from tqdm import tqdm
+import argparse
+from tools.drift import add_drift
+from gmssl import sm4
+# from Crypto.Util.Padding import pad, unpad
+import time
+from tools.Login import Login
 
 """
 加密模式：sm2非对称加密sm4密钥
@@ -20,43 +28,19 @@ from tqdm import tqdm
 # 偏移量
 # default_iv = '\1\2\3\4\5\6\7\x08' 失效
 
-# 加载配置文件
-cfg_path = "./config.ini"
-conf = configparser.ConfigParser()
-conf.read(cfg_path, encoding="utf-8")
+# PublicKey = 'BL7JvEAV7Wci0h5YAysN0BPNVdcUhuyJszJLRwnurav0CGftcrVcvrWeCPBIjIIBF371teRbrCS9V1Wyq7i3Arc=' # 旧公钥
+PublicKey = 'BDdKFsuBf51UObke1pEgfER17biBg/5r8slqE4s8oOa8lVesWgIUxsRc+AmZ72GcuJ56f7avnyJe3CJY4n00LU4=' # 3.4.7
+PrivateKey = 'P3s0+rMuY4Nt5cUWuOCjMhDzVNdom+W0RvdV6ngM+/E=' # 3.4.7 私钥失效
+PUBLIC_KEY = b64decode(PublicKey)
+PRIVATE_KEY = b64decode(PrivateKey)
 
-# 学校、keys和版本信息
-my_host = conf.get("Yun", "school_host") # 学校的host
-default_key = conf.get("Yun", "CipherKey") # 加密密钥
-CipherKeyEncrypted = conf.get("Yun", "CipherKeyEncrypted") # 加密密钥的sm2加密版本
-my_app_edition = conf.get("Yun", "app_edition") # app版本（我手机上是3.0.0）
-
-# 用户信息，包括设备信息
-my_token = conf.get("User", 'token') # 用户token 
-my_device_id = conf.get("User", "device_id") # 设备id （据说很随机，抓包搞几次试试看）
-my_key = conf.get("User", "map_key") # map_key是高德地图的开发者密钥
-my_device_name = conf.get("User", "device_name") # 手机名称
-my_sys_edition = conf.get("User", "sys_edition") # 安卓版本（大版本）
-my_utc = conf.get("User", "utc")
-my_uuid = conf.get("User", "uuid")
-my_sign = conf.get("User", "sign")
-
-# 跑步相关的信息
-# my_point = conf.get("Run", "point") # 当前位置，取消，改到map.json
-min_distance = float(conf.get("Run", "min_distance")) # 2公里
-allow_overflow_distance = float(conf.get("Run", "allow_overflow_distance")) # 允许偏移超出的公里数
-single_mileage_min_offset = float(conf.get("Run", "single_mileage_min_offset")) # 单次配速偏移最小
-single_mileage_max_offset = float(conf.get("Run", "single_mileage_max_offset")) # 单次配速偏移最大
-cadence_min_offset = int(conf.get("Run", "cadence_min_offset")) # 最小步频偏移
-cadence_max_offset = int(conf.get("Run", "cadence_max_offset")) # 最大步频偏移
-split_count = int(conf.get("Run", "split_count")) 
-exclude_points = json.loads(conf.get("Run", "exclude_points")) # 排除点
-min_consume = float(conf.get("Run", "min_consume")) # 配速最小和最大
-max_consume = float(conf.get("Run", "max_consume"))
-strides = float(conf.get("Run", "strides"))
-
-PUBLIC_KEY = b64decode(conf.get("Yun", "PublicKey"))
-PRIVATE_KEY = b64decode(conf.get("Yun", "PrivateKey"))
+def parse_args():
+    parser = argparse.ArgumentParser(description='云运动自动跑步脚本')
+    parser.add_argument('-f', '--config_path', type=str, default='./config.ini', help='配置文件路径')
+    parser.add_argument('-t', '--task_path', type=str, default='./tasks_fch', help='任务文件路径')
+    parser.add_argument('-a', '--auto_run', action='store_true', help='自动跑步，默认打表')
+    parser.add_argument('-d', '--drift', action='store_true', help='是否添加漂移')
+    return parser.parse_args()
 
 def string_to_hex(input_string):
     # 将字符串转换为十六进制表示，然后去除前缀和分隔符
@@ -69,6 +53,7 @@ def bytes_to_hex(input_string):
     return hex_string
 
 sm2_crypt = sm2.CryptSM2(public_key=bytes_to_hex(PUBLIC_KEY[1:]), private_key=bytes_to_hex(PRIVATE_KEY), mode=1, asn1=True)
+
 def encrypt_sm4(value, SM_KEY, isBytes = False):
     crypt_sm4 = CryptSM4()
     crypt_sm4.set_key(SM_KEY, SM4_ENCRYPT)
@@ -95,10 +80,29 @@ def decrypt_sm2(info):
     decode_info = sm2_crypt.decrypt(decode_info)
     return decode_info
 
-def default_post(router, data, headers=None, m_host=None, isBytes=False):
+
+def getsign(utc, uuid):
+    sb = (
+        "platform="
+        + platform
+        + "&utc="
+        + str(utc)
+        + "&uuid="
+        + str(uuid)
+        + "&appsecret="
+        + md5key
+    )
+    m = hashlib.md5()
+    m.update(sb.encode("utf-8"))
+    return m.hexdigest()
+
+def default_post(router, data, headers=None, m_host=None, isBytes=False, gen_sign=True):
     if m_host is None:
         m_host = my_host
     url = m_host + router
+    if gen_sign:
+        my_utc = str(int(time.time()))
+    sign = getsign(my_utc, my_uuid) if gen_sign else my_sign
     if headers is None:
         headers = {
             'token': my_token,
@@ -113,7 +117,7 @@ def default_post(router, data, headers=None, m_host=None, isBytes=False):
             'User-Agent': 'okhttp/3.12.0',
             'utc': my_utc,
             'uuid': my_uuid,
-            'sign': my_sign
+            'sign': sign
         }
     data_json = {
         "cipherKey":CipherKeyEncrypted,
@@ -125,9 +129,32 @@ def default_post(router, data, headers=None, m_host=None, isBytes=False):
     except:
         return req.text
 
+def noTokenLogin():
+    print("config中token为空")
+    LoginChoice = 'n'
+    if LoginChoice == 'y':
+        token,DeviceId,DeviceName,uuid,sys_edition = Login.main()
+        #TEST CONTENT
+        print("是否保存本次登录产生的token和uuid？(y/n)")
+        TokenWrite = input()
+        if TokenWrite == 'y':
+            config = configparser.ConfigParser()
+            config.read('config.ini', encoding='utf-8')
+            config.set('User', 'token', token)
+            config.set('User', 'uuid', uuid)
+            config.set('User', 'device_id', DeviceId)
+            config.set('User', 'device_name', DeviceName)
+            config.set('User', 'sys_edition', sys_edition)
+            with open('config.ini', 'w+', encoding='utf-8') as f:
+                config.write(f)
+        return token,DeviceId,DeviceName,uuid,sys_edition
+    elif LoginChoice == 'n':
+        print("由于缺少token退出")
+        exit()
+
 class Yun_For_New:
 
-    def __init__(self, auto_generate_task = True):
+    def __init__(self, auto_generate_task = False):
         data = json.loads(default_post("/run/getHomeRunInfo", ""))['data']['cralist'][0]
         self.raType = data['raType']
         self.raId = data['id']
@@ -352,14 +379,13 @@ class Yun_For_New:
                 time.sleep(sleep_time)
             print('第' + str(task_index + 1) + '个点处理完毕！')
 
-    def do_by_points_map(self, path = './tasks', random_choose = False):
+    def do_by_points_map(self, path = './tasks', random_choose = False, isDrift = False):
         files = os.listdir(path)
         files.sort()
         if not random_choose:
             print("检测到可用表格：[输入-1随机选择，输入序号选择对应task]")
             print(files)
-            choice = -1
-
+            choice = int(input("选择："))
             if choice == -1:
                 file = os.path.join(path, random.choice(files))
                 print("随机选择：" + file)
@@ -370,6 +396,8 @@ class Yun_For_New:
             print("随机选择：" + file)
         with open(file, 'r', encoding='utf-8') as f:
             self.task_map = json.loads(f.read())
+        if isDrift:
+            self.task_map = add_drift(self.task_map)
         points = []
         count = 0
         for point in tqdm(self.task_map['data']['pointsList'], leave=True):
@@ -381,7 +409,8 @@ class Yun_For_New:
                 'isFence': 'Y',
                 'isMock': False,
                 "runMileage": point['runMileage'],
-                "runTime": point['runTime']
+                "runTime": point['runTime'],
+                "ts": str(int(time.time()))
             }
             points.append(point_changed)
             count += 1
@@ -469,31 +498,92 @@ class Yun_For_New:
         print(resp)
 
 if __name__ == '__main__':
+    args = parse_args()
+    cfg_path = args.config_path
+    # 加载配置文件
+    # cfg_path = "./config.ini"
+    conf = configparser.ConfigParser()
+    conf.read(cfg_path, encoding="utf-8")
 
-    print("确定数据无误：")
-    print("Token: ".ljust(15) + my_token)
-    print('deviceId: '.ljust(15) + my_device_id)
-    print('deviceName: '.ljust(15) +  my_device_name)
-    print('utc: '.ljust(15) + my_utc)
-    print('uuid: '.ljust(15) + my_uuid)
-    print('sign: '.ljust(15) + my_sign)
-    print('map_key: '.ljust(15) + my_key)
+    # 学校、keys和版本信息
+    my_host = conf.get("Yun", "school_host") # 学校的host
+    default_key = conf.get("Yun", "cipherkey") # 加密密钥
+    CipherKeyEncrypted = conf.get("Yun", "cipherkeyencrypted") # 加密密钥的sm2加密版本
+    my_app_edition = conf.get("Yun", "app_edition") # app版本（我手机上是3.0.0）
 
-    # sure = input("确认：[y/n]")
-    sure = 'y'
+    # 用户信息，包括设备信息
+    my_token = conf.get("User", 'token') # 用户token 
+    my_device_id = conf.get("User", "device_id") # 设备id （据说很随机，抓包搞几次试试看）
+    my_key = conf.get("User", "map_key") # map_key是高德地图的开发者密钥
+    my_device_name = conf.get("User", "device_name") # 手机名称
+    my_sys_edition = conf.get("User", "sys_edition") # 安卓版本（大版本）
+    my_utc = conf.get('User', 'utc') or str(int(time.time()))
+    my_uuid = conf.get("User", "uuid")
+    my_sign = conf.get("User", "sign")
+
+    # 跑步相关的信息
+    # my_point = conf.get("Run", "point") # 当前位置，取消，改到map.json
+    min_distance = float(conf.get("Run", "min_distance")) # 2公里
+    allow_overflow_distance = float(conf.get("Run", "allow_overflow_distance")) # 允许偏移超出的公里数
+    single_mileage_min_offset = float(conf.get("Run", "single_mileage_min_offset")) # 单次配速偏移最小
+    single_mileage_max_offset = float(conf.get("Run", "single_mileage_max_offset")) # 单次配速偏移最大
+    cadence_min_offset = int(conf.get("Run", "cadence_min_offset")) # 最小步频偏移
+    cadence_max_offset = int(conf.get("Run", "cadence_max_offset")) # 最大步频偏移
+    split_count = int(conf.get("Run", "split_count")) 
+    exclude_points = json.loads(conf.get("Run", "exclude_points")) # 排除点
+    min_consume = float(conf.get("Run", "min_consume")) # 配速最小和最大
+    max_consume = float(conf.get("Run", "max_consume"))
+    strides = float(conf.get("Run", "strides"))
+
+    PUBLIC_KEY = b64decode(conf.get("Yun", "PublicKey"))
+    PRIVATE_KEY = b64decode(conf.get("Yun", "PrivateKey"))
+
+    md5key = conf.get("Yun", "md5key")
+    platform = conf.get("Yun", "platform")
+    if not args.auto_run:
+        if len(conf.get('User', 'token')) == 0:
+            my_token,my_device_id,my_device_name,my_uuid,my_sys_edition = noTokenLogin()
+        # 检查版本是否小于3.4.5
+        if conf.get('Yun', 'app_edition') < '3.4.5':
+            conf.set('Yun', 'app_edition', '3.4.5')
+            with open(cfg_path, 'w+', encoding='utf-8') as f:
+                conf.write(f)
+        #config app版本检查 当前可用3.4.5
+
+    if args.auto_run:
+        sure = 'y'
+    else:
+        sure = 'y'
     try:
         if sure == 'y':
-            # print_table = input("打表模式(固定路线，无需高德地图key)：[y/n]")
-            print_table = 'y'
-            if print_table == 'y':
-                print("warning:\n默认提供的表格是宣城校区的风雨操场跑步路线，\n跑步的步频、配速等信息受tasklist.json控制，不会读取map.json，config.ini的跑步信息失效")
-                Yun = Yun_For_New(auto_generate_task=False)
-                Yun.start()
-                Yun.do_by_points_map()
-                Yun.finish_by_points_map()
+            if args.auto_run:
+                print_table = 'y'
             else:
-                # quick_model = input("快速模式(瞬间跑完)：[y/n]")
-                quick_model = 'n'
+                print_table = 'y'
+            if print_table == 'y':
+                if not args.auto_run:
+                    choice = '3'
+                    if(choice == '1'): path = "./tasks_fch"
+                    elif(choice == '2'): path = "./tasks_txl"
+                    elif(choice == '3') : path = "./tasks_xc"
+                    else: path = "./tasks_else"
+                    isDrift = 'y'
+                    if isDrift == 'y':
+                        driftChoice = True
+                    else:
+                        driftChoice = False
+                    Yun = Yun_For_New(auto_generate_task=False)
+                    Yun.start()
+                    Yun.do_by_points_map(path=path, isDrift=driftChoice)
+                    Yun.finish_by_points_map()
+                else:
+                    path = args.task_path
+                    Yun = Yun_For_New(auto_generate_task=False)
+                    Yun.start()
+                    Yun.do_by_points_map(path=path, random_choose=True, isDrift=args.drift)
+                    Yun.finish_by_points_map()
+            else:
+                quick_model = input("快速模式(瞬间跑完)：[y/n]")
                 if quick_model == 'y':
                     Yun = Yun_For_New()
                     Yun.start()
