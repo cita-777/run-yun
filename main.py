@@ -385,7 +385,8 @@ class Yun_For_New:
         if not random_choose:
             print("检测到可用表格：[输入-1随机选择，输入序号选择对应task]")
             print(files)
-            choice = int(input("选择："))
+            #choice = int(input("选择："))
+            choice = -1
             if choice == -1:
                 file = os.path.join(path, random.choice(files))
                 print("随机选择：" + file)
